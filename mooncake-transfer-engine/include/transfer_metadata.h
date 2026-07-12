@@ -56,8 +56,16 @@ class TransferMetadata {
 #ifdef ENABLE_MULTI_PROTOCOL
         std::string protocol;  // for multi-protocol mode (cxl/tcp/rdma)
 #endif
-        std::vector<uint32_t> lkey;         // for rdma
-        std::vector<uint32_t> rkey;         // for rdma
+        // EFA/CXI's libfabric provider returns 64-bit MR keys (fi_mr_key()), so
+        // these must be 64-bit wide to avoid truncation. RDMA verbs keys are
+        // 32-bit and the non-EFA/CXI path keeps them as such.
+#if defined(USE_EFA) || defined(USE_CXI)
+        using mr_key_t = uint64_t;
+#else
+        using mr_key_t = uint32_t;
+#endif
+        std::vector<mr_key_t> lkey;         // for rdma/efa
+        std::vector<mr_key_t> rkey;         // for rdma/efa
         std::string shm_name;               // for nvlink and hip
         uint64_t offset;                    // for cxl
         std::vector<std::string> tseg;      // for ub/urma
@@ -104,6 +112,19 @@ class TransferMetadata {
 
         int tcp_data_port;
 
+        // In dual-NIC setups (MC_RDMA_BIND_ADDRESS), the RDMA-reachable
+        // address may differ from the TCP-routable segment name.  When
+        // non-empty, NIC paths are constructed using this value instead
+        // of `name`.
+        std::string rdma_server_name;
+
+        // Returns the server name to use for NIC path construction.
+        // Uses rdma_server_name when available, otherwise falls back
+        // to name.
+        const std::string &nicPathServerName() const {
+            return rdma_server_name.empty() ? name : rdma_server_name;
+        }
+
         void dump() const;
     };
 
@@ -131,6 +152,9 @@ class TransferMetadata {
         std::string reply_msg;  // on error
 #ifdef USE_EFA
         std::string efa_addr;  // EFA endpoint address (hex encoded)
+#endif
+#ifdef USE_CXI
+        std::string cxi_addr;
 #endif
     };
 
@@ -177,6 +201,9 @@ class TransferMetadata {
     int addRpcMetaEntry(const std::string &server_name, RpcMetaDesc &desc);
 
     int removeRpcMetaEntry(const std::string &server_name);
+
+    // Re-publish the local RPC meta entry to the HTTP metadata server.
+    int rePublishRpcMetaEntry(const std::string &server_name);
 
     int getRpcMetaEntry(const std::string &server_name, RpcMetaDesc &desc);
     int getNotifies(std::vector<NotifyDesc> &notifies);

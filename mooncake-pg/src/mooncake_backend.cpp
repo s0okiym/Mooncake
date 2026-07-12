@@ -1,13 +1,13 @@
 #include <ATen/cuda/CUDAContext.h>
-#include <cuda_runtime.h>
+#include <cuda_alike.h>
 #include <torch/torch.h>
 #include <torch/csrc/distributed/c10d/Backend.hpp>
-#include <cuda_alike.h>
 #include <mooncake_backend.h>
 #include <p2p_proxy.h>
 #include <thread>
 #include <chrono>
 #include <atomic>
+#include <cstdlib>
 #include <memory>
 #include "connection_poller.h"
 #include "memory_location.h"
@@ -15,6 +15,18 @@
 #include "pg_utils.h"
 
 namespace mooncake {
+namespace {
+
+#ifdef USE_MACA
+static void requireMacaHostTransport() {
+    TORCH_CHECK(std::getenv("MC_MACA_HOST_TRANSPORT") != nullptr,
+                "MACA PG requires MC_MACA_HOST_TRANSPORT=1 so the transfer "
+                "engine uses a host transport.");
+}
+
+#endif
+
+}  // namespace
 
 constexpr const char* REGISTER_BUFFER_ERROR_MSG =
     "Failed to register local memory.";
@@ -32,6 +44,7 @@ TransferEngine* MooncakeBackend::engine_ = new TransferEngine(true);
 // worker_ is now owned per backend instance via MooncakeWorkerManager.
 bool MooncakeBackend::engineInitialized_ = false;
 int MooncakeBackend::backendIndex_ = 0;
+TransferEngine* MooncakeBackend::externalEngine_ = nullptr;
 
 std::vector<uint8_t> serialize(const ExtensionState& state) {
     uint32_t rankCount = static_cast<uint32_t>(state.activeRanks.size());
@@ -206,7 +219,14 @@ MooncakeBackend::MooncakeBackend(
     }
 
     // Initialize transfer engine
-    if (!engineInitialized_) {
+    if (externalEngine_) {
+        // Use externally-provided engine (already initialized), skip init.
+        engine_ = externalEngine_;
+        engineInitialized_ = true;
+    } else if (!engineInitialized_) {
+#ifdef USE_MACA
+        requireMacaHostTransport();
+#endif
         engine_->init(P2PHANDSHAKE, hostIp_);
         engineInitialized_ = true;
     }
@@ -249,9 +269,31 @@ MooncakeBackend::MooncakeBackend(
             TORCH_CHECK(!rc, REGISTER_BUFFER_ERROR_MSG);
         }
 
+#ifdef USE_MACA
     } else {
         for (size_t i = 0; i < 2; i++) {
-            cudaError err = cudaMalloc(&send_buffer_[i], kBufferSize);
+            cudaError_t err = cudaMalloc(&send_buffer_[i], kBufferSize);
+            TORCH_CHECK(!err,
+                        c10::str("Failed to allocate MACA GPU send buffer"));
+
+            int rc = engine_->registerLocalMemory(send_buffer_[i], kBufferSize,
+                                                  location);
+            TORCH_CHECK(!rc, REGISTER_BUFFER_ERROR_MSG);
+        }
+
+        for (size_t i = 0; i < 2; i++) {
+            cudaError_t err = cudaMalloc(&recv_buffer_[i], kBufferSize);
+            TORCH_CHECK(!err,
+                        c10::str("Failed to allocate MACA GPU recv buffer"));
+
+            int rc = engine_->registerLocalMemory(recv_buffer_[i], kBufferSize,
+                                                  location);
+            TORCH_CHECK(!rc, REGISTER_BUFFER_ERROR_MSG);
+        }
+#else
+    } else {
+        for (size_t i = 0; i < 2; i++) {
+            cudaError_t err = cudaMalloc(&send_buffer_[i], kBufferSize);
             TORCH_CHECK(!err, c10::str("Failed to allocate CUDA send buffer"));
 
             int rc = engine_->registerLocalMemory(send_buffer_[i], kBufferSize,
@@ -260,13 +302,14 @@ MooncakeBackend::MooncakeBackend(
         }
 
         for (size_t i = 0; i < 2; i++) {
-            cudaError err = cudaMalloc(&recv_buffer_[i], kBufferSize);
+            cudaError_t err = cudaMalloc(&recv_buffer_[i], kBufferSize);
             TORCH_CHECK(!err, c10::str("Failed to allocate CUDA recv buffer"));
 
             int rc = engine_->registerLocalMemory(recv_buffer_[i], kBufferSize,
                                                   location);
             TORCH_CHECK(!rc, REGISTER_BUFFER_ERROR_MSG);
         }
+#endif
     }
 
     // Register CPU sync regions
@@ -311,7 +354,7 @@ MooncakeBackend::MooncakeBackend(
         engine_, P2PProxy::Options{
                      .is_cpu = isCpu_,
                      .rank = rank_,
-                     .size = size_,
+                     .size = max_size,
                      .cuda_device_index = cuda_device_index,
                  });
     p2p_device_worker_->registerProxy(p2p_proxy_);
@@ -380,8 +423,9 @@ MooncakeBackend::MooncakeBackend(
             TORCH_CHECK(options_->activeRanks_.device().is_cpu(),
                         "activeRanks must be on CPU.");
         } else {
-            TORCH_CHECK(options_->activeRanks_.device().is_cuda(),
-                        "activeRanks must be on CUDA.");
+            TORCH_CHECK(
+                options_->activeRanks_.device().type() == c10::DeviceType::CUDA,
+                "activeRanks must be on GPU.");
         }
         if (max_size != size) {
             TORCH_CHECK(options_->activeRanks_.numel() == max_size,
@@ -419,7 +463,9 @@ MooncakeBackend::MooncakeBackend(
     auto deviceType = isCpu ? c10::DeviceType::CPU : c10::DeviceType::CUDA;
     auto shim = c10::make_intrusive<MooncakeP2PShim>(this);
     setBackend(deviceType, BackendType::CUSTOM, shim);
+#ifndef MOONCAKE_EP_USE_MUSA
     setDefaultBackend(BackendType::CUSTOM);
+#endif
 
     // Increment backend index
     ++backendIndex_;
@@ -1006,6 +1052,13 @@ void MooncakeBackend::shutdown() {
                 cudaFree(recv_buffer_[i]);
             }
         }
+        if (isCpu_) {
+            delete[] meta_->activeRanks;
+        } else {
+            cudaFreeHost(meta_->activeRanks);
+        }
+        meta_->activeRanks = nullptr;
+        meta_->activeRanksDevice = nullptr;
     }
 }
 
@@ -1247,5 +1300,13 @@ void MooncakeBackend::joinGroup() {
     }
     connection_ctx_->waitUntilAllConnected();
     waitForExtensionState();
+}
+
+void MooncakeBackend::setExternalEngine(TransferEngine* engine) {
+    externalEngine_ = engine;
+    if (engine) {
+        LOG(INFO) << "MooncakeBackend: external TransferEngine set (ptr="
+                  << engine << ")";
+    }
 }
 }  // namespace mooncake

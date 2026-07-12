@@ -2,9 +2,18 @@
 
 ## Overview
 
-Mooncake Store supports offloading KV cache objects from distributed memory to local SSD. When memory pressure is high, the master instructs clients to persist selected objects to disk. On a cache miss, the client automatically falls back to reading from SSD.
+Mooncake Store supports offloading KV cache objects from distributed memory to a local filesystem path, typically backed by local SSDs. When memory pressure is high, the master instructs clients to persist selected objects to disk. On a cache miss, the client automatically falls back to reading from the local filesystem-backed offload path.
 
-SSD offload is currently **only available in Real Client mode**. The real client is a standalone process that communicates with the application (e.g., SGLang) via RPC. All SSD reads and writes happen within this process.
+For measured TTFT and throughput impact in multi-turn workloads, see [Mooncake SSD Offload Benchmark](../performance/mooncake/ssd-offload-benchmark-results.md).
+
+SSD offload requires the **Real Client** and supports two deployment modes:
+
+- **Mode A: Embedded Real Client** — the Python process embeds the Real Client, and SSD offload runs inside the Python process.
+- **Mode B: Standalone Real Client + DummyClient** — a standalone `mooncake_client` process runs SSD offload, and the Python process connects via a DummyClient.
+
+In both modes, all SSD reads and writes happen within the Real Client (embedded or standalone).
+
+SSD offload does not use the master's `--root_fs_dir` option. Configure the local disk path on each Real Client with `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH`; the master tracks offloaded objects as `LOCAL_DISK` replicas. `--root_fs_dir` is a legacy parameter from an older persistence path and may cause issues when used with `--enable_offload=true`.
 
 ## Startup Steps
 
@@ -22,9 +31,30 @@ mooncake_master \
     --enable_offload=true
 ```
 
-### Step 3: Start the real client with SSD offload enabled
+### Step 3A (Mode A): Start the application with embedded Real Client
 
-Use the `--enable_offload` flag to enable SSD offload, and set environment variables to specify the storage path and backend:
+Use the `--enable_ssd_offload` flag to enable SSD offload, and set environment variables to specify the storage path and backend:
+
+```python
+from mooncake.store import MooncakeDistributedStore
+
+store = MooncakeDistributedStore()
+store.setup(
+    local_hostname="<machine IP>",
+    metadata_server="P2PHANDSHAKE",
+    global_segment_size=4 * 1024 * 1024 * 1024,  # 4 GB
+    local_buffer_size=512 * 1024 * 1024,  # 512 MB
+    protocol="rdma",
+    rdma_devices="eth0",
+    master_server_addr="127.0.0.1:50051",
+    enable_ssd_offload=True,
+    ssd_offload_path="/nvme/mooncake_offload"
+)
+```
+
+### Step 3B (Mode B): Start the standalone real client with SSD offload enabled and connect it with the dummy client
+
+Set the same SSD offload environment variables as in Mode A.
 
 ```bash
 export MOONCAKE_OFFLOAD_FILE_STORAGE_PATH=/nvme/mooncake_offload
@@ -41,26 +71,20 @@ mooncake_client \
     --metadata_server="P2PHANDSHAKE"
 ```
 
-> **Note:** When using `bucket_storage_backend` or `file_per_key_storage_backend`, the real client scans existing SSD metadata on startup and reports it to the master automatically. `offset_allocator_storage_backend` is the exception: it truncates its data file during initialization and does not recover previously offloaded objects after a restart.
-
-### Step 4: Connect the application to the real client
-
-The application (e.g., SGLang) connects to the real client via the `MooncakeDistributedStore` Python SDK. SSD offload and fallback loading are handled transparently.
+The application (e.g., SGLang) connects to the standalone real client via the `MooncakeDistributedStore` Python SDK. The Python process acts as a DummyClient; SSD offload and fallback loading are handled by the standalone real client process.
 
 ```python
 from mooncake.store import MooncakeDistributedStore
 
 store = MooncakeDistributedStore()
-store.setup(
-    local_hostname="<machine IP>",
-    metadata_server="P2PHANDSHAKE",
-    global_segment_size=4 * 1024 * 1024 * 1024,   # 4 GB
-    local_buffer_size=512 * 1024 * 1024, #512MB
-    protocol="rdma",
-    device_name="eth0",
-    master_server_address="127.0.0.1:50051",
+store.setup_dummy(
+    mem_pool_size=4 * 1024 * 1024 * 1024,  # 4 GB
+    local_buffer_size=512 * 1024 * 1024,  # 512 MB
+    server_address="<machine IP>:50052"   # mooncake_client RPC address from Step 3
 )
 ```
+
+> **Note:** When using `bucket_storage_backend` or `file_per_key_storage_backend`, the real client scans existing SSD metadata on startup and reports it to the master automatically. `offset_allocator_storage_backend` is the exception: it truncates its data file during initialization and does not recover previously offloaded objects after a restart.
 
 ---
 
@@ -70,7 +94,7 @@ store.setup(
 |------|---------|-------------|
 | `--metadata_server` | `http://127.0.0.1:8080/metadata` | Metadata server connection string |
 | `--master_server_address` | `127.0.0.1:50051` | Master address |
-| `--host` | `0.0.0.0` | This machine's externally reachable IP |
+| `--host` | `0.0.0.0` | This machine's externally reachable IP. Accepts `ip:port` to specify the data plane port for TransferEngine |
 | `--port` | `50052` | Real client RPC listening port |
 | `--device_names` | ` ` | NIC name(s), e.g. `eth0` or `mlx5_0` |
 | `--protocol` | `tcp` | Transport protocol: `tcp` or `rdma` |
@@ -93,7 +117,7 @@ store.setup(
 | `MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES` | `2199023255552` (2 TB) | Maximum disk usage |
 | `MOONCAKE_OFFLOAD_TOTAL_KEYS_LIMIT` | `10000000` | Maximum number of objects on disk |
 | `MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS` | `10` | Interval for offload heartbeat to master (seconds) |
-| `MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_INTERVAL_SECONDS` | `10` | Interval for reclaiming expired offload buffers; defaults to the heartbeat interval in the current implementation |
+| `MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_INTERVAL_SECONDS` | `1` | Interval for reclaiming expired offload buffers; defaults to the heartbeat interval in the current implementation |
 | `MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_TTL_MS` | `5000` | Lease time for buffers returned by `batch_get_offload_object` before GC reclaims them |
 | `MOONCAKE_OFFLOAD_USE_URING` | `false` | Enable io_uring for async file I/O |
 
@@ -106,7 +130,7 @@ Applies when `MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR=bucket_storage_backend
 | `MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES` | `268435456` (256 MB) | Max size per bucket |
 | `MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT` | `500` | Max keys per bucket |
 | `MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE` | `0` | Eviction threshold in bytes. When set to `0`, the backend uses **90% of the physical disk capacity** as the quota — it does not mean unlimited. Set an explicit value to control disk usage precisely. |
-| `MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY` | `none` | Eviction policy: `none` / `fifo` / `lru` |
+| `MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY` | `fifo` | Eviction policy: `none` / `fifo` / `lru` |
 
 ### File-per-key backend settings
 

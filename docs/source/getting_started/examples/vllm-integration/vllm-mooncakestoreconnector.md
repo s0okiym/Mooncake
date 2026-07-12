@@ -1,4 +1,13 @@
+---
+orphan: true
+---
+
 # Guide: vLLM MooncakeStoreConnector
+
+```{admonition} Archived
+:class: warning
+This page has been **consolidated** into the unified [KV Cache Storage & Sharing](kv-cache-storage) guide (see the V1 Recommended section). Please use that guide for up-to-date information.
+```
 
 ## Overview
 
@@ -111,10 +120,12 @@ vllm serve meta-llama/Llama-3.1-8B-Instruct \
     }'
 ```
 
-Proxy：
+Proxy:
 
 ```shell
-python examples/disaggregated/disaggregated_serving/mooncake_connector/mooncake_connector_proxy.py --prefill http://192.168.0.2:8100 --decode http://192.168.0.3:8200
+python examples/disaggregated/disaggregated_serving/mooncake_connector/mooncake_connector_proxy.py \
+    --prefill http://192.168.0.2:8100 \
+    --decode http://192.168.0.3:8200
 ```
 
 
@@ -126,3 +137,8 @@ python examples/disaggregated/disaggregated_serving/mooncake_connector/mooncake_
 > ```
 >
 > Without this, identical prompts may produce different block hashes on different DP ranks, preventing cross-instance prefix cache hits.
+
+
+### 4. Performance
+
+Please refer to this [webpage](../../../performance/vllm/vllm-v1-mooncake-store.md).

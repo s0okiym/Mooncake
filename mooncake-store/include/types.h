@@ -89,8 +89,13 @@ static constexpr uint64_t DEFAULT_KV_SOFT_PIN_TTL_MS =
 static constexpr bool DEFAULT_ALLOW_EVICT_SOFT_PINNED_OBJECTS = true;
 static constexpr double DEFAULT_EVICTION_RATIO = 0.05;
 static constexpr double DEFAULT_EVICTION_HIGH_WATERMARK_RATIO = 0.95;
+static constexpr double DEFAULT_NOF_EVICTION_RATIO = 0.05;
+static constexpr double DEFAULT_NOF_EVICTION_HIGH_WATERMARK_RATIO = 0.95;
 static constexpr int64_t DEFAULT_MASTER_VIEW_LEASE_TTL_SEC = 5;  // in seconds
 static constexpr int64_t DEFAULT_CLIENT_LIVE_TTL_SEC = 10;       // in seconds
+static constexpr int64_t DEFAULT_NOF_HEARTBEAT_INTERVAL_SEC = 10;
+static constexpr uint32_t DEFAULT_NOF_HEARTBEAT_PROBE_TIMEOUT_MS = 1000;
+static constexpr uint32_t DEFAULT_NOF_HEARTBEAT_FAILURES_THRESHOLD = 3;
 static constexpr uint64_t DEFAULT_SNAPSHOT_INTERVAL_SEC =
     60 * 10;  // in seconds
 static constexpr uint64_t DEFAULT_SNAPSHOT_CHILD_TIMEOUT_SEC =
@@ -210,12 +215,92 @@ constexpr const char* CONFIG_KEY_PROTOCOL = "protocol";
 constexpr const char* CONFIG_KEY_RDMA_DEVICES = "rdma_devices";
 constexpr const char* CONFIG_KEY_MASTER_SERVER_ADDR = "master_server_addr";
 constexpr const char* CONFIG_KEY_IPC_SOCKET_PATH = "ipc_socket_path";
+constexpr const char* CONFIG_KEY_TENANT_ID = "tenant_id";
 
 // Store client configuration defaults
 static constexpr size_t DEFAULT_GLOBAL_SEGMENT_SIZE = 1024 * 1024 * 16;  // 16MB
 static constexpr size_t DEFAULT_LOCAL_BUFFER_SIZE = 1024 * 1024 * 16;    // 16MB
 constexpr const char* DEFAULT_PROTOCOL = "tcp";
 constexpr const char* DEFAULT_MASTER_SERVER_ADDR = "127.0.0.1:50051";
+
+// Original: returns a new string (copies when tenant_id is non-empty).
+// Kept for backward compatibility with callers that need an owned string.
+inline std::string NormalizeTenantId(const std::string& tenant_id) {
+    return tenant_id.empty() ? "default" : tenant_id;
+}
+
+inline bool IsValidTenantId(const std::string& tenant_id) {
+    if (tenant_id.empty() || tenant_id.front() == '_') {
+        return false;
+    }
+    for (unsigned char c : tenant_id) {
+        if (c < 0x20 || c == 0x7f) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Zero-copy variant: returns a const reference that is valid as long as
+// the input `tenant_id` is alive. When the input is empty, returns a
+// reference to a static "default" string. Use this in hot-path callers
+// (getMetadataShardIndex, getTenantQuotaShardIndex, MakeObjectIdentity, …)
+// to eliminate the string copy that NormalizeTenantId() would otherwise
+// perform on every invocation.
+//
+// WARNING: The returned reference must not outlive the input tenant_id.
+// Passing a temporary string (e.g., NormalizeTenantIdRef(get_temp_str()))
+// creates a dangling reference when the temporary is destroyed at the
+// semicolon. Callers that need an owned string should use NormalizeTenantId().
+inline const std::string& NormalizeTenantIdRef(const std::string& tenant_id) {
+    static const std::string kDefaultTenant = "default";
+    return tenant_id.empty() ? kDefaultTenant : tenant_id;
+}
+
+inline std::string MakeTenantScopedStorageKey(const std::string& tenant_id,
+                                              const std::string& key) {
+    const auto& normalized_tenant = NormalizeTenantIdRef(tenant_id);
+    std::string scoped_key;
+    scoped_key.reserve(normalized_tenant.size() + key.size() + 1);
+    scoped_key.append(normalized_tenant);
+    scoped_key.push_back('\0');
+    scoped_key.append(key);
+    return scoped_key;
+}
+
+inline std::pair<std::string, std::string> ParseTenantScopedStorageKey(
+    const std::string& storage_key) {
+    const auto separator = storage_key.find('\0');
+    if (separator == std::string::npos) {
+        return {"default", storage_key};
+    }
+    return {NormalizeTenantId(storage_key.substr(0, separator)),
+            storage_key.substr(separator + 1)};
+}
+
+struct OffloadTaskItem {
+    std::string tenant_id;
+    std::string key;
+    int64_t size;
+
+    bool operator==(const OffloadTaskItem& other) const {
+        return tenant_id == other.tenant_id && key == other.key &&
+               size == other.size;
+    }
+};
+YLT_REFL(OffloadTaskItem, tenant_id, key, size);
+
+struct PromotionTaskItem {
+    std::string tenant_id;
+    std::string key;
+    int64_t size;
+
+    bool operator==(const PromotionTaskItem& other) const {
+        return tenant_id == other.tenant_id && key == other.key &&
+               size == other.size;
+    }
+};
+YLT_REFL(PromotionTaskItem, tenant_id, key, size);
 
 // Store client configuration validation limits
 static constexpr size_t MIN_SEGMENT_SIZE = 1024;                          // 1KB
@@ -302,7 +387,8 @@ enum class ErrorCode : int32_t {
     TRANSFER_FAIL = -800,  ///< Transfer operation failed.
 
     // RPC errors (Range: -900 to -999)
-    RPC_FAIL = -900,  ///< RPC operation failed.
+    RPC_FAIL = -900,     ///< RPC operation failed.
+    RPC_TIMEOUT = -901,  ///< RPC call timed out (client-side deadline hit).
 
     // High availability errors (Range: -1000 to -1099)
     ETCD_OPERATION_ERROR = -1000,   ///< etcd operation failed.
@@ -343,6 +429,17 @@ enum class ErrorCode : int32_t {
     TASK_PENDING_LIMIT_EXCEEDED =
         -1401,              ///< Total pending tasks exceed the limit.
     JOB_NOT_FOUND = -1402,  ///< Job not found.
+
+    // DFS errors (Range: -1600 to -1699)
+    DFS_NETWORK_TIMEOUT = -1600,      ///< DFS network timeout.
+    DFS_SERVICE_UNAVAILABLE = -1601,  ///< DFS service unavailable.
+    DFS_QUOTA_EXCEEDED = -1602,       ///< DFS quota exceeded.
+    DFS_PERMISSION_DENIED = -1603,    ///< DFS permission denied.
+    DFS_STALE_HANDLE = -1604,         ///< DFS file handle expired.
+    DFS_PARTIAL_WRITE = -1605,        ///< DFS partial write success.
+    TENANT_QUOTA_EXCEEDED = -1700,    ///< Tenant memory quota exceeded.
+    TENANT_NOT_REGISTERED = -1701,    ///< Tenant has no quota policy.
+    TENANT_NOT_EMPTY = -1702,         ///< Tenant still owns objects or quota.
 };
 
 int32_t toInt(ErrorCode errorCode) noexcept;
@@ -389,18 +486,35 @@ struct Segment {
     // TE p2p endpoint (ip:port) for transport-only addressing
     std::string te_endpoint{};
     std::string protocol;
+    std::string host_id{};
     Segment() = default;
 };
-YLT_REFL(Segment, id, name, base, size, te_endpoint, protocol);
+YLT_REFL(Segment, id, name, base, size, te_endpoint, protocol, host_id);
 
 /**
  * @brief Allocation strategy type for segment allocation
  */
 enum class AllocationStrategyType {
-    RANDOM = 0,        // Pure random allocation
-    FREE_RATIO_FIRST,  // Free-ratio-first allocation
-    CXL,               // CXL-specific allocation
+    RANDOM = 0,            // Pure random allocation
+    FREE_RATIO_FIRST,      // Free-ratio-first allocation
+    CXL,                   // CXL-specific allocation
+    SSD_FREE_RATIO_FIRST,  // SSD free-ratio-first allocation
+    LOCAL_FIRST            // Prefer local host before ordered remote fallback
 };
+
+/**
+ * @brief Represents a contiguous NoF ssd region
+ */
+struct NoFSegment {
+    UUID id{0, 0};
+    std::string name{};  // Logical segment name used for preferred allocation
+    uintptr_t base{0};
+    size_t size{0};
+    // TE p2p endpoint (ip:port) for transport-only addressing
+    std::string te_endpoint{};
+    NoFSegment() = default;
+};
+YLT_REFL(NoFSegment, id, name, base, size, te_endpoint);
 
 /**
  * @brief Client status from the master's perspective
