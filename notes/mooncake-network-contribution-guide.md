@@ -131,7 +131,69 @@ ctest --output-on-failure
 
 ---
 
-## 六、一句话总结
+## 六、从"懂原理"到"扣细节"
+
+很多人会经历这个阶段：架构图看了很多，感觉自己懂了，但真到看代码、改代码、定位问题时，发现细节是空的。这很正常。
+
+### 6.1 为什么会"飘"
+
+| 你以为懂了 | 实际还没碰到的细节 |
+|-----------|------------------|
+| "Segment 就是一段内存" | Segment 怎么注册？生命周期谁管？卸载时怎么保证没未完成传输？ |
+| "RDMA transport 做 P2P" | QP 怎么创建和复用？wr 怎么组织？重连时未完成请求怎么办？ |
+| "metadata server 做 peer 发现" | segment 信息怎么序列化？etcd/HTTP/Redis 三种后端一致性差异？ |
+| "Master 管理对象映射" | 一个 get 请求从 Python API 到 Master 再到 Transfer Engine，经过多少层 RPC？ |
+
+### 6.2 三个方法把知识压到地面
+
+**方法一：跟踪一条完整请求链路，逐行看**
+
+不要泛泛读文件，选一条具体路径。例如 Python 端 `store.put(key, tensor)` 到底层 RDMA 的全流程：
+
+```
+mooncake-wheel/mooncake/structured_object_store.py
+  → mooncake-integration/store/store_py.cpp
+  → mooncake-store/src/real_client.cpp
+  → mooncake-store/src/master_client.cpp (RPC to master)
+  → mooncake-store/src/master_service.cpp
+  → back to client
+  → mooncake-transfer-engine/src/transfer_engine_impl.cpp
+  → mooncake-transfer-engine/src/transport/rdma_transport/rdma_context.cpp
+  → ibv_post_send()
+```
+
+每经过一层，问自己：
+- 这一层输入输出是什么？
+- 做了什么决策？
+- 出错时怎么处理？
+- 有没有锁/异步/回调？
+
+**方法二：改一个小东西，然后跑测试验证**
+
+- 在 `rdma_transport.cpp` 里加一行日志，打印每次 post_send 的 wr_id 和长度
+- 把 TCP transport 的 buffer size 改大/改小，跑 `transfer_engine_bench` 看吞吐变化
+- 在 `transfer_engine_impl.cpp` 的 `transfer()` 入口加一个延迟 histogram
+- 故意制造一个 RDMA 连接断开场景，看重连逻辑是否触发
+
+目标不是做优化，而是**让代码在你面前"动"起来**。
+
+**方法三：给自己出题，用代码回答**
+
+- 一个 Batch 里 100 个 request，其中 3 个失败，Transfer Engine 怎么告诉上层？
+- metadata server 挂掉 10 秒，已有的 RDMA 连接还能传数据吗？
+- SSD offload 时，数据是从 GPU 直接到 SSD，还是先拉回 CPU？
+
+不要猜，去代码里找答案，然后把结论写成几行注释或文档。
+
+### 6.3 本周最小行动
+
+> **在 `rdma_transport.cpp` 或 `tcp_transport.cpp` 里加 5 行日志，打印每次传输的 size、opcode、status，然后跑一遍单元测试和 benchmark，把输出保存下来。**
+
+这件事很小，但会让你从"我觉得传输是这样的"变成"我看到传输就是这样的"。
+
+---
+
+## 七、一句话总结
 
 > **先把 TCP/RDMA transport 和 Transfer Engine 的 segment/batch 模型跑通、读透，再理解 Mooncake Store 控制面与数据面分离，最后结合公司实际网络硬件和 KV Cache 流量特征做针对性优化。**
 
